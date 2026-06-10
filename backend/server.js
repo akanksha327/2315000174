@@ -130,11 +130,30 @@ let notifications = [
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: "64kb" }));
-app.use(morgan("dev"));
 
 app.use((req, res, next) => {
   req.requestId = req.header("X-Request-Id") || crypto.randomUUID();
   res.setHeader("X-Request-Id", req.requestId);
+  next();
+});
+
+// Structured JSON request logging
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    console.log(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      requestId: req.requestId,
+      method: req.method,
+      url: req.originalUrl,
+      status: res.statusCode,
+      durationMs: duration,
+      userAgent: req.get("user-agent"),
+      ip: req.ip,
+      user: req.user ? { id: req.user.id, role: req.user.role } : null,
+    }));
+  });
   next();
 });
 
@@ -176,16 +195,16 @@ app.get("/v1/health", (req, res) => {
 app.get(
   "/v1/notifications",
   asyncHandler(async (req, res) => {
-    const { page, limit, type, isRead, sort } = parseListQuery(req);
-    const validationError = validateListQuery({ page, limit, type, isRead, sort });
+    const { page, limit, type, isRead, sort, cursor } = parseListQuery(req);
+    const validationError = validateListQuery({ page, limit, type, isRead, sort, cursor });
 
     if (validationError) {
       return sendValidationError(req, res, validationError);
     }
 
     const result = postgresEnabled
-      ? await listNotificationsFromPostgres({ user: req.user, page, limit, type, isRead, sort })
-      : listNotificationsFromMemory({ user: req.user, page, limit, type, isRead, sort });
+      ? await listNotificationsFromPostgres({ user: req.user, page, limit, type, isRead, sort, cursor })
+      : listNotificationsFromMemory({ user: req.user, page, limit, type, isRead, sort, cursor });
 
     res.json({
       success: true,
@@ -514,10 +533,11 @@ function parseListQuery(req) {
     type: req.query.type,
     isRead: req.query.isRead,
     sort: req.query.sort ?? "-createdAt",
+    cursor: req.query.cursor,
   };
 }
 
-function validateListQuery({ page, limit, type, isRead, sort }) {
+function validateListQuery({ page, limit, type, isRead, sort, cursor }) {
   if (type && !VALID_TYPES.has(type)) {
     return [
       {
@@ -633,7 +653,7 @@ function validateNotificationBody(body) {
   return errors;
 }
 
-async function listNotificationsFromPostgres({ user, page, limit, type, isRead, sort }) {
+async function listNotificationsFromPostgres({ user, page, limit, type, isRead, sort, cursor }) {
   const whereParts = ["n.deleted_at IS NULL", "(n.expires_at IS NULL OR n.expires_at > NOW())"];
   const values = [];
   let paramIndex = 1;
@@ -675,6 +695,28 @@ async function listNotificationsFromPostgres({ user, page, limit, type, isRead, 
     whereParts.push("rs.id IS NULL");
   }
 
+  let cursorData = null;
+  if (cursor) {
+    try {
+      cursorData = JSON.parse(Buffer.from(cursor, "base64").toString("utf8"));
+    } catch (e) {
+      // ignore invalid cursor
+    }
+  }
+
+  if (cursorData && Array.isArray(cursorData) && cursorData.length === 2) {
+    const [cursorSortVal, cursorId] = cursorData;
+    const direction = sort.startsWith("-") ? -1 : 1;
+    const operator = direction === -1 ? "<" : ">";
+    const sortField = sort.replace("-", "") === "publishedAt" ? "n.published_at" : "n.created_at";
+
+    whereParts.push(
+      `(${sortField} ${operator} $${paramIndex} OR (${sortField} = $${paramIndex} AND n.id ${operator} $${paramIndex + 1}))`
+    );
+    values.push(cursorSortVal, cursorId);
+    paramIndex += 2;
+  }
+
   const whereSql = whereParts.join(" AND ");
   const countResult = await pool.query(
     `
@@ -689,33 +731,52 @@ async function listNotificationsFromPostgres({ user, page, limit, type, isRead, 
   const totalItems = countResult.rows[0].total;
   const totalPages = Math.ceil(totalItems / limit);
   const orderBy = sortToSql(sort);
+
+  const limitValue = limit;
+  const offsetValue = cursorData ? 0 : (page - 1) * limit;
+
   const rowsResult = await pool.query(
     `
       SELECT n.*, rs.read_at
       FROM notifications n
       ${join}
       WHERE ${whereSql}
-      ORDER BY ${orderBy}, n.id DESC
+      ORDER BY ${orderBy}, n.id ${sort.startsWith("-") ? "DESC" : "ASC"}
       LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
     `,
-    [...values, limit, (page - 1) * limit],
+    [...values, limitValue, offsetValue],
   );
 
+  const data = rowsResult.rows.map(rowToNotification);
+
+  let nextCursor = null;
+  const hasNextPage = cursorData ? (data.length === limit) : (page < totalPages);
+
+  if (data.length > 0 && hasNextPage) {
+    const lastItem = rowsResult.rows[rowsResult.rows.length - 1];
+    const sortFieldName = sort.replace("-", "") === "publishedAt" ? "published_at" : "created_at";
+    const rawVal = lastItem[sortFieldName];
+    const sortVal = rawVal instanceof Date ? rawVal.toISOString() : rawVal;
+
+    nextCursor = Buffer.from(JSON.stringify([sortVal, lastItem.id])).toString("base64");
+  }
+
   return {
-    data: rowsResult.rows.map(rowToNotification),
+    data,
     pagination: {
-      page,
+      page: cursorData ? null : page,
       limit,
       totalItems,
-      totalPages,
-      hasNextPage: page < totalPages,
-      hasPreviousPage: page > 1,
+      totalPages: cursorData ? null : totalPages,
+      hasNextPage,
+      hasPreviousPage: cursorData ? (cursor !== undefined) : (page > 1),
+      nextCursor,
     },
   };
 }
 
-function listNotificationsFromMemory({ user, page, limit, type, isRead, sort }) {
-  const visibleNotifications = notifications
+function listNotificationsFromMemory({ user, page, limit, type, isRead, sort, cursor }) {
+  let visibleNotifications = notifications
     .filter((notification) => isVisibleToUser(notification, user))
     .map((notification) => serializeNotification(notification, user.id))
     .filter((notification) => !type || notification.type === type)
@@ -725,19 +786,56 @@ function listNotificationsFromMemory({ user, page, limit, type, isRead, sort }) 
     )
     .sort((a, b) => compareNotifications(a, b, sort));
 
+  let cursorData = null;
+  if (cursor) {
+    try {
+      cursorData = JSON.parse(Buffer.from(cursor, "base64").toString("utf8"));
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  if (cursorData && Array.isArray(cursorData) && cursorData.length === 2) {
+    const [cursorSortVal, cursorId] = cursorData;
+    const direction = sort.startsWith("-") ? -1 : 1;
+    const sortField = sort.replace("-", "");
+
+    visibleNotifications = visibleNotifications.filter((item) => {
+      const itemVal = item[sortField];
+      const comp = itemVal.localeCompare(cursorSortVal);
+      if (comp !== 0) {
+        return direction === -1 ? comp < 0 : comp > 0;
+      }
+      const idComp = item.id.localeCompare(cursorId);
+      return direction === -1 ? idComp < 0 : idComp > 0;
+    });
+  }
+
   const totalItems = visibleNotifications.length;
   const totalPages = Math.ceil(totalItems / limit);
-  const start = (page - 1) * limit;
+  const start = cursorData ? 0 : (page - 1) * limit;
+  const sliceData = visibleNotifications.slice(start, start + limit);
+
+  let nextCursor = null;
+  const hasNextPage = cursorData ? (visibleNotifications.length > limit) : (page < totalPages);
+
+  if (sliceData.length > 0 && hasNextPage) {
+    const lastItem = sliceData[sliceData.length - 1];
+    const sortField = sort.replace("-", "");
+    const sortVal = lastItem[sortField];
+    nextCursor = Buffer.from(JSON.stringify([sortVal, lastItem.id])).toString("base64");
+  }
 
   return {
-    data: visibleNotifications.slice(start, start + limit),
+    data: sliceData,
     pagination: {
-      page,
+      page: cursorData ? null : page,
       limit,
       totalItems,
-      totalPages,
-      hasNextPage: page < totalPages,
-      hasPreviousPage: page > 1,
+      totalPages: cursorData ? null : totalPages,
+      hasNextPage,
+      hasPreviousPage: cursorData ? (cursor !== undefined) : (page > 1),
+      nextCursor,
     },
   };
 }
