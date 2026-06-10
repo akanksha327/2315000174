@@ -1,6 +1,8 @@
-# 2315000174
+# Campus Notification System
 
-Campus Notification System backend API for managing student notifications related to placements, events, and results.
+> Project ID: 2315000174
+
+Backend API for managing student notifications related to placements, events, and results.
 
 ## Project Structure
 
@@ -8,6 +10,7 @@ Campus Notification System backend API for managing student notifications relate
 AffordM/
 ├─ backend/
 │  └─ server.js
+├─ notification_system_design.md
 ├─ package.json
 ├─ package-lock.json
 └─ README.md
