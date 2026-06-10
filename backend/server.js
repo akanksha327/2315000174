@@ -1,7 +1,6 @@
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
-import morgan from "morgan";
 import crypto from "node:crypto";
 import pg from "pg";
 
@@ -371,11 +370,16 @@ app.post(
       : createNotificationInMemory(notification, req.user.id);
 
     idempotencyStore.set(idempotencyKey, savedNotification.id);
-    broadcastNotification(notification);
 
-    res.status(201).json({
+    // Asynchronously dispatch delivery job in background (Stage 5 Architecture)
+    dispatchNotificationDelivery(notification).catch(console.error);
+
+    res.status(202).json({
       success: true,
-      data: savedNotification,
+      data: {
+        ...savedNotification,
+        deliveryStatus: "ACCEPTED"
+      },
     });
   }),
 );
@@ -1312,6 +1316,106 @@ ON notification_read_status (student_id);
 CREATE INDEX IF NOT EXISTS idx_notification_read_status_notification
 ON notification_read_status (notification_id);
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_read_status_student_notification
+CREATE INDEX IF NOT EXISTS idx_notification_read_status_student_notification
 ON notification_read_status (student_id, notification_id);
+
+CREATE TABLE IF NOT EXISTS notification_delivery_log (
+  id TEXT PRIMARY KEY,
+  student_id TEXT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+  channel VARCHAR(10) NOT NULL CHECK (channel IN ('EMAIL', 'PUSH')),
+  status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'SENT', 'FAILED', 'READ')),
+  retry_count SMALLINT NOT NULL DEFAULT 0,
+  error_message TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (student_id, notification_id, channel)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_delivery_log_status
+ON notification_delivery_log (status);
 `;
+
+async function dispatchNotificationDelivery(notification) {
+  let targetedStudents = [];
+  if (postgresEnabled) {
+    const audience = notification.audience;
+    let result;
+    if (audience.scope === "ALL_STUDENTS") {
+      result = await pool.query("SELECT id FROM students WHERE is_active = TRUE");
+    } else {
+      result = await pool.query(
+        "SELECT id FROM students WHERE is_active = TRUE AND department = $1 AND (academic_year = $2 OR $2 IS NULL)",
+        [audience.department, audience.year ?? null]
+      );
+    }
+    targetedStudents = result.rows.map(row => row.id);
+  } else {
+    targetedStudents = Array.from(students.values())
+      .filter(student => {
+        if (notification.audience.scope === "ALL_STUDENTS") return true;
+        return student.department === notification.audience.department &&
+               (!notification.audience.year || student.year === notification.audience.year);
+      })
+      .map(student => student.id);
+  }
+
+  for (const studentId of targetedStudents) {
+    for (const channel of ["EMAIL", "PUSH"]) {
+      if (postgresEnabled) {
+        await pool.query(
+          `
+            INSERT INTO notification_delivery_log (id, student_id, notification_id, channel, status)
+            VALUES ($1, $2, $3, $4, 'PENDING')
+            ON CONFLICT DO NOTHING
+          `,
+          [crypto.randomUUID(), studentId, notification.id, channel]
+        );
+      }
+      simulateWorkerJob(studentId, notification.id, channel).catch(console.error);
+    }
+  }
+
+  broadcastNotification(notification);
+}
+
+async function simulateWorkerJob(studentId, notificationId, channel, retryCount = 0) {
+  try {
+    await new Promise(resolve => setTimeout(resolve, 100 + Math.random() * 200));
+
+    if (Math.random() < 0.05) {
+      throw new Error("Transient network timeout contacting gateway API.");
+    }
+
+    if (postgresEnabled) {
+      await pool.query(
+        `
+          UPDATE notification_delivery_log
+          SET status = 'SENT', updated_at = NOW()
+          WHERE student_id = $1 AND notification_id = $2 AND channel = $3
+        `,
+        [studentId, notificationId, channel]
+      );
+    }
+  } catch (error) {
+    const nextRetry = retryCount + 1;
+    if (nextRetry <= 3) {
+      const delay = Math.pow(2, nextRetry) * 1000;
+      setTimeout(() => {
+        simulateWorkerJob(studentId, notificationId, channel, nextRetry).catch(console.error);
+      }, delay);
+    } else {
+      if (postgresEnabled) {
+        await pool.query(
+          `
+            UPDATE notification_delivery_log
+            SET status = 'FAILED', error_message = $1, updated_at = NOW()
+            WHERE student_id = $2 AND notification_id = $3 AND channel = $4
+          `,
+          [error.message, studentId, notificationId, channel]
+        );
+      }
+    }
+  }
+}
+

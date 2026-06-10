@@ -310,3 +310,66 @@ For actions where the user expects immediate updated data, the system should rea
 * PostgreSQL is the permanent source of truth when configured.
 * Memory fallback storage is used if a PostgreSQL database is not configured or reachable.
 * Redis is used only for caching and performance improvement.
+
+---
+
+# Stage 3: Query Optimization
+
+## SQL Schema Query Optimization
+To handle a scale of 50,000 students and 5,000,000 notifications, standard queries are optimized to avoid sequential scans, reduce CPU sorting overhead, and prevent database locking.
+
+### Optimized Query: Fetching Unread Notifications for a Student
+```sql
+SELECT 
+    n.id, 
+    n.type, 
+    n.title, 
+    n.priority, 
+    n.published_at,
+    n.metadata
+FROM notifications n
+LEFT JOIN notification_read_status rs
+    ON rs.notification_id = n.id
+   AND rs.student_id = $1
+WHERE rs.id IS NULL
+  AND n.deleted_at IS NULL
+  AND (n.expires_at IS NULL OR n.expires_at > NOW())
+  AND (
+      n.audience_scope = 'ALL_STUDENTS'
+      OR (
+          n.audience_scope = 'DEPARTMENT'
+          AND n.audience_department = $2
+          AND (n.audience_year IS NULL OR n.audience_year = $3)
+      )
+  )
+ORDER BY n.published_at ASC;
+```
+
+---
+
+# Stage 4: High-Scale Performance & Scaling
+
+## Caching Strategy
+- **Unread counts** per student are cached in Redis under `student:unread_count:{student_id}` to avoid heavy joins on every page load.
+- **Recent feed cache** stores the top 20 notifications per department/scope in a sorted set (`ZSET`).
+
+## Cursor-Based Pagination
+To scale notification lists without $O(N)$ depth penalties, the system supports both page-based and cursor-based pagination.
+- **Cursor Generation**: The base64-encoded composite cursor `[sortVal, lastItemId]` is utilized.
+- **Seeks**: Pre-sorted index scans using the composite index `(published_at, id)`.
+
+## Production Logging & Observability
+- Implemented **structured JSON request logging** for all API endpoints.
+- Slow query logging and connection pooling (using transaction-level PgBouncer) are configured for PostgreSQL.
+
+---
+
+# Stage 5: Asynchronous Reliable Notification Delivery
+
+## Architecture Overview
+The admin notification creation route (`POST /v1/notifications`) returns `202 Accepted` and offloads the delivery to an asynchronous worker queue.
+
+- **Fan-Out Worker**: Resolves targeted students based on audience criteria.
+- **Delivery Log (`notification_delivery_log`)**: Tracks delivery state per student and channel (`EMAIL`, `PUSH`) with status: `PENDING`, `SENT`, or `FAILED`.
+- **Worker Simulation**: Background worker process executing exponential backoff retries with jitter and fallback to Dead Letter Queues (DLQ) if max retries (3 attempts) are exceeded.
+

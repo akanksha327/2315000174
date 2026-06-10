@@ -1116,3 +1116,129 @@ To scale the architecture 100x without refactoring the core codebase:
 2. **PostgreSQL Declarative Partitioning**: Partition the `notification_read_status` table by range on the `created_at` timestamp (e.g., monthly partitions). Detaching and archiving data older than 6 months keeps active partition indexes small enough to fit completely in RAM.
 3. **Distributed Caching**: Scale Redis using Redis Sentinel or a Cluster configuration to handle millions of unread count queries.
 4. **Rate Limiting**: Add rate-limiting layers at the API Gateway level (e.g., Kong, AWS API Gateway) using token bucket algorithms to prevent API abuse during result publication spikes.
+
+# Stage 5
+
+## 1. Critique of the Current Approach
+
+The current synchronous processing loop:
+```javascript
+// For every student:
+// 1. Save notification
+// 2. Send email
+// 3. Send push notification
+```
+It is a critical failure point for production systems at scale:
+* **High Latency & HTTP Timeouts**: Network requests to external APIs (SMTP servers, Firebase Cloud Messaging, APNs) average 100ms–500ms. Iterating through 10,000 students takes between 16 to 83 minutes. The originating client request will timeout, and the server process will exhaust its event loop thread pool.
+* **No Transactional Integrity**: If the server crashes on student #4,025, the database is left in an inconsistent state. There is no trace of who did or did not receive the notification.
+* **Lack of Fault Isolation**: If FCM is down, the entire loop crashes, preventing emails from being sent.
+* **Write Amplification**: Writing individual copies of a notification directly to a database for thousands of students synchronously spikes write IOPS, degrading database performance for normal queries.
+
+---
+
+## 2. Reliable Delivery Architecture
+
+The proposed system shifts notification delivery to an **Asynchronous Event-Driven Architecture** utilizing a message broker (RabbitMQ) and stateless background workers.
+
+```mermaid
+graph TD
+    Admin[Admin Client] -->|POST /v1/notifications| API[Web API Node]
+    API -->|1. Write Meta Row| DB[(PostgreSQL)]
+    API -->|2. Publish job| Ex[RabbitMQ Exchange]
+    Ex -->|Route| PQ[Publish Queue]
+    PQ -->|Consume| PW[Fan-out Worker]
+    PW -->|3. Query Target Students| DB
+    PW -->|4. Push individual jobs| Ex
+    Ex -->|Route| EQ[Email Queue]
+    Ex -->|Route| UQ[Push Queue]
+    EQ -->|Consume| EW[Email Worker]
+    UQ -->|Consume| MW[Push Worker]
+    EW -->|5. Send SMTP| Mail[SMTP Server]
+    MW -->|5. Send FCM/APNs| Push[Push Gateways]
+    EW -->|6. Log status| DB
+    MW -->|6. Log status| DB
+```
+
+### Data Flow Execution:
+1. **Request Ingestion**: The administrator posts the notification to `/v1/notifications`.
+2. **Metadata Persist**: The API server writes a single row to the `notifications` table and publishes a lightweight event `notification.publish` containing `{ "notification_id": "ntf_992" }` to the message broker.
+3. **Immediate Acknowledgement**: The API immediately returns a `202 Accepted` response to the admin, keeping HTTP connection time under 50ms.
+4. **Target Resolution (Fan-out)**: A dedicated **Fan-out Worker** consumes the `notification.publish` message, queries the targeting parameters (`audience_scope`, `department`, `year`) against the `students` table, and splits the execution.
+5. **Job Dispatch**: For each targeted student, the Fan-out Worker publishes two specialized tasks:
+   * To `email-delivery-queue`: `{ "student_id": "stu_223", "notification_id": "ntf_992", "channel": "EMAIL" }`
+   * To `push-delivery-queue`: `{ "student_id": "stu_223", "notification_id": "ntf_992", "channel": "PUSH" }`
+6. **Worker Consumption**: Specialized workers subscribe to the respective queues, process tasks concurrently in batches, make external HTTP requests, and update the delivery tracking log.
+
+---
+
+## 3. Queueing & Reliability Components
+
+### Message Queues (RabbitMQ)
+Acts as a buffer to absorb traffic spikes (e.g. grade publications). If 500,000 notifications are published simultaneously, RabbitMQ stores the messages safely in memory/disk while workers consume them at a sustainable rate.
+
+### Background Workers
+Stateless Node.js processes deployed as containerized services (e.g., Kubernetes pods). They can scale up or down dynamically depending on queue depth.
+
+### Retry Mechanisms
+External API calls fail due to transient errors (rate-limiting, network timeouts, SMTP drops). Workers catch these errors and re-publish the job with **Exponential Backoff and Jitter**:
+$$\text{Delay} = 2^{\text{retry\_count}} \times 1000\,\text{ms} + \text{Random Jitter}$$
+This prevents overloading downstream APIs upon recovery.
+
+### Dead Letter Queues (DLQ)
+If a message fails after a defined maximum retry count (e.g., 5 attempts), the broker routes it to a Dead Letter Queue (`email-delivery-dlq` or `push-delivery-dlq`). This isolates corrupt payloads (e.g. invalid emails) and keeps the primary queues active. Alerts are placed on the DLQ depth for administrator inspection.
+
+### Fault Tolerance & Manual Acknowledgement
+To guarantee that messages are never lost during processing:
+* **Manual Ack Mode**: Workers only send an `ACK` frame back to RabbitMQ *after* the job has been completed successfully.
+* **Automatic Re-queuing**: If a worker node crashes mid-job, the TCP connection drops. RabbitMQ immediately detects this and automatically marks the message as unacknowledged (`nack`) and re-queues it for another worker.
+
+---
+
+## 4. Delivery Tracking and Failures
+
+### Delivery Log Schema
+A tracking table is introduced to log and monitor delivery states:
+```sql
+CREATE TABLE notification_delivery_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id TEXT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+    channel VARCHAR(10) NOT NULL CHECK (channel IN ('EMAIL', 'PUSH')),
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING' 
+        CHECK (status IN ('PENDING', 'SENT', 'FAILED', 'READ')),
+    retry_count SMALLINT NOT NULL DEFAULT 0,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (student_id, notification_id, channel)
+);
+```
+
+### Failure Mitigation
+* **Hard Failures**: If an external service returns a permanent error (e.g., `404 Recipient Not Found`), the worker logs `status = 'FAILED'`, writes the error message, and `ACK`s the message to discard it from the queue, preventing endless retries.
+* **Circuit Breakers**: If the FCM API returns continuous 5xx errors, a circuit breaker (e.g., Oppsy/Brakes) trips. The push workers fail-fast immediately, preserving resources, and RabbitMQ holds the messages in the queue until the circuit breaker resets.
+
+---
+
+## 5. Horizontal Scaling & High Availability
+
+* **stateless workers**: Scale the email and push worker processes independently. If push notification load is heavy, scale the push worker replicas without touching the core API servers.
+* **Cluster Deployment**: Deploy RabbitMQ in a mirrored cluster across multiple Availability Zones (AZs) using **Quorum Queues**. This ensures message replication across nodes, preventing loss if a physical disk or AZ goes offline.
+
+---
+
+## 6. Guaranteeing Zero Message Loss (At-Least-Once Delivery)
+
+To ensure that no notification is ever dropped:
+1. **Persistent Messages**: Configure RabbitMQ to write incoming messages to disk (`delivery_mode = 2`).
+2. **Database First Write**: The API writes to the PostgreSQL primary before queuing the event. If queueing fails, the API returns an error, and the transaction rolls back.
+3. **Consumer Idempotency**: Since network retries can lead to double delivery (at-least-once guarantee), consumer workers must verify states before executing. They check if `notification_delivery_log` already has `status = 'SENT'` for the target key before sending.
+
+---
+
+## 7. Monitoring & Observability
+
+* **Queue Depth and Lag**: Set up alert thresholds on RabbitMQ queue depths. If the queue length grows beyond a defined count, scale worker pods.
+* **Distributed Tracing**: Inject the initial `requestId` (from HTTP headers) into the RabbitMQ message header metadata. Workers read this metadata and attach it to downstream logs, allowing end-to-end trace correlation using tools like OpenTelemetry and Jaeger.
+* **Dead Letter Alerts**: Hook alerts to DLQ size metrics. Any message landing in a DLQ immediately triggers a slack alert or PagerDuty event for manual investigation.
+* **Health Checks**: Implement deep health checks on worker pods verifying broker connectivity and DB pool health.
